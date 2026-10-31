@@ -1,17 +1,20 @@
 package monitor
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,7 +40,6 @@ const (
 	h5URL   = "https://api.live.bilibili.com/xlive/web-room/v1/index/getH5InfoByRoom?room_id=%s"
 	roomURL = "https://live.bilibili.com/%s"
 	neptune = "window.__NEPTUNE_IS_MY_WAIFU__="
-	csvHead = "ts,ts_unix,offset_s,room_id,host,title,live_status,popularity,watched,likes,recording,audience\n"
 )
 
 var (
@@ -45,6 +47,13 @@ var (
 
 	defaultMu  sync.RWMutex
 	defaultMgr *Manager
+
+	// CSV 列序只在这里维护，表头与数据行共用，避免两处定义漂移。
+	csvColumns = []string{
+		"ts", "ts_unix", "offset_s", "room_id", "host", "title",
+		"live_status", "popularity", "watched", "likes", "recording", "audience",
+	}
+	csvHead = strings.Join(csvColumns, ",") + "\n"
 )
 
 // Sample 是一次人气采样。
@@ -65,13 +74,15 @@ type Sample struct {
 
 // Status 描述采样器的运行状态。
 type Status struct {
-	Running      bool   `json:"running"`
-	Output       string `json:"output"`
-	IntervalSec  int    `json:"interval_sec"`
-	LastSampleAt string `json:"last_sample_at"`
-	LastError    string `json:"last_error"`
-	RoomCount    int    `json:"room_count"`
-	SampleCount  int    `json:"sample_count"`
+	Running             bool   `json:"running"`               // 采样器 goroutine 是否仍在运行
+	Output              string `json:"output"`                // CSV 目标路径
+	IntervalSec         int    `json:"interval_sec"`          // 人气采样间隔
+	AudienceIntervalSec int    `json:"audience_interval_sec"` // 房间观众实际刷新周期（缓存 TTL 按采样节拍向上取整）
+	LastSampleAt        string `json:"last_sample_at"`
+	LastError           string `json:"last_error"`   // 最近一轮采样的网络/接口错误，整轮无错才清空
+	OutputError         string `json:"output_error"` // 落盘失败原因，与 LastError 相互独立
+	RoomCount           int    `json:"room_count"`
+	SampleCount         int    `json:"sample_count"`
 }
 
 // Manager 周期性从 B 站公开接口采样直播间人气，并把结果写入 CSV。
@@ -80,11 +91,13 @@ type Manager struct {
 	samples      []Sample
 	lastSampleAt time.Time
 	lastErr      string
+	outputErr    string
 	roomCount    int
 	running      bool
 
 	interval time.Duration
 	output   string
+	openErr  error
 	client   *biliClient
 
 	audienceMu sync.Mutex
@@ -99,14 +112,15 @@ type audienceEntry struct {
 	at    time.Time
 }
 
-// Default 返回当前运行的采样器，未启动时为 nil。
+// Default 返回最近一次启动的采样器；从未启动过时为 nil（已停止时仍非 nil，需看 Status.Running）。
 func Default() *Manager {
 	defaultMu.RLock()
 	defer defaultMu.RUnlock()
 	return defaultMgr
 }
 
-// Start 启动采样器。outPutPath 是录制输出目录，数据会写到它同级的 data/ 下。
+// Start 启动采样器。数据写到 filepath.Dir(outPutPath)/data/viewer_log.csv：
+// 默认 outPutPath 为 ./ 时即 ./data/，配置为 ./recordings 时即 recordings 的同级 data/。
 func Start(ctx context.Context, inst *instance.Instance, outPutPath string) *Manager {
 	interval := defaultInterval
 	if v := os.Getenv("BILILIVE_VIEWER_INTERVAL"); v != "" {
@@ -131,8 +145,9 @@ func Start(ctx context.Context, inst *instance.Instance, outPutPath string) *Man
 	}
 
 	if err := m.openOutput(); err != nil {
-		m.setError(err)
-		log.WithError(err).Warn("人气监控：初始化数据文件失败，采样结果将只保留在内存中")
+		m.openErr = err
+		m.setOutputError(err)
+		log.WithError(err).Error("人气监控：初始化数据文件失败，采样结果将只保留在内存中")
 	}
 
 	defaultMu.Lock()
@@ -161,6 +176,11 @@ func (m *Manager) openOutput() error {
 	if st, err := os.Stat(m.output); err == nil && st.Size() > 0 {
 		fresh = false
 	}
+	if !fresh {
+		if err := checkCSVHeader(m.output); err != nil {
+			return err
+		}
+	}
 	f, err := os.OpenFile(m.output, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -169,9 +189,39 @@ func (m *Manager) openOutput() error {
 	m.writer = csv.NewWriter(f)
 	if fresh {
 		if _, err := f.WriteString("\xEF\xBB\xBF" + csvHead); err != nil {
+			_ = f.Close()
+			m.file = nil
+			m.writer = nil
 			return err
 		}
 		m.writer.Flush()
+		if err := m.writer.Error(); err != nil {
+			_ = f.Close()
+			m.file = nil
+			m.writer = nil
+			return err
+		}
+	}
+	return nil
+}
+
+// checkCSVHeader 校验已有文件的表头，避免列序变更后把新行追加到旧表头下面。
+func checkCSVHeader(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	line, err := bufio.NewReader(f).ReadString('\n')
+	if err != nil && line == "" {
+		return err
+	}
+	line = strings.TrimPrefix(line, "\xEF\xBB\xBF")
+	line = strings.TrimRight(line, "\r\n")
+	want := strings.TrimSuffix(csvHead, "\n")
+	if line != want {
+		return fmt.Errorf("数据文件表头与当前版本不一致: %q", line)
 	}
 	return nil
 }
@@ -179,6 +229,9 @@ func (m *Manager) openOutput() error {
 func (m *Manager) closeOutput() {
 	if m.writer != nil {
 		m.writer.Flush()
+		if err := m.writer.Error(); err != nil {
+			m.setOutputError(err)
+		}
 	}
 	if m.file != nil {
 		_ = m.file.Close()
@@ -210,6 +263,7 @@ func (m *Manager) sampleOnce(ctx context.Context, inst *instance.Instance) {
 		return
 	}
 	rooms := 0
+	hadErr := false
 	for _, l := range inst.Lives.Snapshot() {
 		roomID := parseRoomID(l.GetRawUrl())
 		if roomID == "" {
@@ -228,6 +282,7 @@ func (m *Manager) sampleOnce(ctx context.Context, inst *instance.Instance) {
 
 		data, err := m.client.roomInfo(ctx, roomID)
 		if err != nil {
+			hadErr = true
 			m.setError(err)
 			log.WithError(err).WithField("room_id", roomID).Debug("人气采样失败")
 			continue
@@ -255,12 +310,18 @@ func (m *Manager) sampleOnce(ctx context.Context, inst *instance.Instance) {
 		}
 		s.Audience = m.audienceFor(ctx, roomID)
 
-		m.appendSample(s)
+		if err := m.appendSample(s); err != nil {
+			hadErr = true
+		}
 	}
 
 	m.mu.Lock()
 	m.roomCount = rooms
 	m.mu.Unlock()
+
+	if rooms > 0 && !hadErr {
+		m.clearSampleError()
+	}
 }
 
 func cachedInfo(inst *instance.Instance, l live.Live) *live.Info {
@@ -294,50 +355,81 @@ func recordingState(ctx context.Context, inst *instance.Instance, l live.Live) b
 	return recorder.IsRecording()
 }
 
-func (m *Manager) appendSample(s Sample) {
+func (m *Manager) appendSample(s Sample) error {
 	m.mu.Lock()
 	m.samples = append(m.samples, s)
 	if len(m.samples) > maxSamples {
 		m.samples = m.samples[len(m.samples)-maxSamples:]
 	}
 	m.lastSampleAt = time.Now()
-	m.lastErr = ""
 	m.mu.Unlock()
 
-	m.writeRow(s)
+	if err := m.writeRow(s); err != nil {
+		m.setOutputError(err)
+		return err
+	}
+	m.setOutputError(nil)
+	return nil
 }
 
-func (m *Manager) writeRow(s Sample) {
+func (m *Manager) writeRow(s Sample) error {
 	if m.writer == nil {
-		return
+		if m.openErr != nil {
+			return m.openErr
+		}
+		return fmt.Errorf("输出文件不可用: %s", m.output)
 	}
-	offset := ""
-	if s.OffsetSec != nil {
-		offset = strconv.FormatInt(*s.OffsetSec, 10)
+	record, err := sampleRecord(s)
+	if err != nil {
+		return err
 	}
-	recording := "0"
-	if s.Recording {
-		recording = "1"
+	if err := m.writer.Write(record); err != nil {
+		return err
 	}
-	audience := ""
-	if s.Audience != nil {
-		audience = strconv.FormatInt(*s.Audience, 10)
-	}
-	_ = m.writer.Write([]string{
-		s.TS,
-		strconv.FormatInt(s.TSUnix, 10),
-		offset,
-		s.RoomID,
-		s.Host,
-		s.Title,
-		strconv.Itoa(s.LiveStatus),
-		strconv.FormatInt(s.Popularity, 10),
-		strconv.FormatInt(s.Watched, 10),
-		strconv.FormatInt(s.Likes, 10),
-		recording,
-		audience,
-	})
 	m.writer.Flush()
+	return m.writer.Error()
+}
+
+// sampleRecord 按 csvColumns 的顺序生成一行数据，列序只在 csvColumns 中维护。
+// 新增或删除列时，必须同时更新 csvColumns 和这里的取值映射；缺列会返回错误而不是写空串。
+func sampleRecord(s Sample) ([]string, error) {
+	values := map[string]string{
+		"ts":          s.TS,
+		"ts_unix":     strconv.FormatInt(s.TSUnix, 10),
+		"offset_s":    formatOptInt64(s.OffsetSec),
+		"room_id":     s.RoomID,
+		"host":        s.Host,
+		"title":       s.Title,
+		"live_status": strconv.Itoa(s.LiveStatus),
+		"popularity":  strconv.FormatInt(s.Popularity, 10),
+		"watched":     strconv.FormatInt(s.Watched, 10),
+		"likes":       strconv.FormatInt(s.Likes, 10),
+		"recording":   boolTo01(s.Recording),
+		"audience":    formatOptInt64(s.Audience),
+	}
+	record := make([]string, len(csvColumns))
+	for i, column := range csvColumns {
+		value, ok := values[column]
+		if !ok {
+			return nil, fmt.Errorf("CSV 列 %q 没有对应的取值映射", column)
+		}
+		record[i] = value
+	}
+	return record, nil
+}
+
+func formatOptInt64(v *int64) string {
+	if v == nil {
+		return ""
+	}
+	return strconv.FormatInt(*v, 10)
+}
+
+func boolTo01(v bool) string {
+	if v {
+		return "1"
+	}
+	return "0"
 }
 
 func (m *Manager) setError(err error) {
@@ -347,6 +439,35 @@ func (m *Manager) setError(err error) {
 	m.mu.Lock()
 	m.lastErr = err.Error()
 	m.mu.Unlock()
+}
+
+func (m *Manager) clearSampleError() {
+	m.mu.Lock()
+	m.lastErr = ""
+	m.mu.Unlock()
+}
+
+// setOutputError 记录落盘错误；只在状态变化时打日志，避免持续失败时刷屏。
+func (m *Manager) setOutputError(err error) {
+	m.mu.Lock()
+	if err == nil {
+		if m.outputErr == "" {
+			m.mu.Unlock()
+			return
+		}
+		m.outputErr = ""
+		m.mu.Unlock()
+		log.Info("人气监控：CSV 写入已恢复")
+		return
+	}
+
+	msg := err.Error()
+	changed := m.outputErr != msg
+	m.outputErr = msg
+	m.mu.Unlock()
+	if changed {
+		log.WithError(err).Error("人气监控：写入 CSV 失败，数据可能丢失")
+	}
 }
 
 // Samples 返回最近的采样，limit <= 0 时返回全部（最多 maxSamples 条）。
@@ -370,14 +491,29 @@ func (m *Manager) Snapshot() Status {
 		last = m.lastSampleAt.Format("2006-01-02 15:04:05")
 	}
 	return Status{
-		Running:      m.running,
-		Output:       m.output,
-		IntervalSec:  int(m.interval.Seconds()),
-		LastSampleAt: last,
-		LastError:    m.lastErr,
-		RoomCount:    m.roomCount,
-		SampleCount:  len(m.samples),
+		Running:             m.running,
+		Output:              m.output,
+		IntervalSec:         int(m.interval.Seconds()),
+		AudienceIntervalSec: int(m.effectiveAudienceInterval().Seconds()),
+		LastSampleAt:        last,
+		LastError:           m.lastErr,
+		OutputError:         m.outputErr,
+		RoomCount:           m.roomCount,
+		SampleCount:         len(m.samples),
 	}
+}
+
+// effectiveAudienceInterval 返回房间观众数的实际刷新周期：
+// audienceInterval 是缓存 TTL，实际按采样节拍向上取整。
+func (m *Manager) effectiveAudienceInterval() time.Duration {
+	if m.interval <= 0 {
+		return audienceInterval
+	}
+	n := int(math.Ceil(audienceInterval.Seconds() / m.interval.Seconds()))
+	if n < 1 {
+		n = 1
+	}
+	return time.Duration(n) * m.interval
 }
 
 func parseRoomID(rawURL string) string {
