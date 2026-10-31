@@ -74,13 +74,13 @@ type Sample struct {
 
 // Status 描述采样器的运行状态。
 type Status struct {
-	Running             bool   `json:"running"`
-	Output              string `json:"output"`
-	IntervalSec         int    `json:"interval_sec"`
-	AudienceIntervalSec int    `json:"audience_interval_sec"`
+	Running             bool   `json:"running"`               // 采样器 goroutine 是否仍在运行
+	Output              string `json:"output"`                // CSV 目标路径
+	IntervalSec         int    `json:"interval_sec"`          // 人气采样间隔
+	AudienceIntervalSec int    `json:"audience_interval_sec"` // 房间观众实际刷新周期（缓存 TTL 按采样节拍向上取整）
 	LastSampleAt        string `json:"last_sample_at"`
-	LastError           string `json:"last_error"`
-	OutputError         string `json:"output_error"`
+	LastError           string `json:"last_error"`   // 最近一轮采样的网络/接口错误，整轮无错才清空
+	OutputError         string `json:"output_error"` // 落盘失败原因，与 LastError 相互独立
 	RoomCount           int    `json:"room_count"`
 	SampleCount         int    `json:"sample_count"`
 }
@@ -97,6 +97,7 @@ type Manager struct {
 
 	interval time.Duration
 	output   string
+	openErr  error
 	client   *biliClient
 
 	audienceMu sync.Mutex
@@ -144,6 +145,7 @@ func Start(ctx context.Context, inst *instance.Instance, outPutPath string) *Man
 	}
 
 	if err := m.openOutput(); err != nil {
+		m.openErr = err
 		m.setOutputError(err)
 		log.WithError(err).Error("人气监控：初始化数据文件失败，采样结果将只保留在内存中")
 	}
@@ -363,34 +365,12 @@ func (m *Manager) appendSample(s Sample) error {
 
 func (m *Manager) writeRow(s Sample) error {
 	if m.writer == nil {
-		return fmt.Errorf("输出文件不可用")
+		if m.openErr != nil {
+			return m.openErr
+		}
+		return fmt.Errorf("输出文件不可用: %s", m.output)
 	}
-	offset := ""
-	if s.OffsetSec != nil {
-		offset = strconv.FormatInt(*s.OffsetSec, 10)
-	}
-	recording := "0"
-	if s.Recording {
-		recording = "1"
-	}
-	audience := ""
-	if s.Audience != nil {
-		audience = strconv.FormatInt(*s.Audience, 10)
-	}
-	record := []string{
-		s.TS,
-		strconv.FormatInt(s.TSUnix, 10),
-		offset,
-		s.RoomID,
-		s.Host,
-		s.Title,
-		strconv.Itoa(s.LiveStatus),
-		strconv.FormatInt(s.Popularity, 10),
-		strconv.FormatInt(s.Watched, 10),
-		strconv.FormatInt(s.Likes, 10),
-		recording,
-		audience,
-	}
+	record := sampleRecord(s)
 	if len(record) != len(csvColumns) {
 		return fmt.Errorf("CSV 列数不一致: %d != %d", len(record), len(csvColumns))
 	}
@@ -399,6 +379,44 @@ func (m *Manager) writeRow(s Sample) error {
 	}
 	m.writer.Flush()
 	return m.writer.Error()
+}
+
+// sampleRecord 按 csvColumns 的顺序生成一行数据，列序只在 csvColumns 中维护。
+// 新增或删除列时，必须同时更新 csvColumns 和这里的取值映射。
+func sampleRecord(s Sample) []string {
+	values := map[string]string{
+		"ts":          s.TS,
+		"ts_unix":     strconv.FormatInt(s.TSUnix, 10),
+		"offset_s":    formatOptInt64(s.OffsetSec),
+		"room_id":     s.RoomID,
+		"host":        s.Host,
+		"title":       s.Title,
+		"live_status": strconv.Itoa(s.LiveStatus),
+		"popularity":  strconv.FormatInt(s.Popularity, 10),
+		"watched":     strconv.FormatInt(s.Watched, 10),
+		"likes":       strconv.FormatInt(s.Likes, 10),
+		"recording":   boolTo01(s.Recording),
+		"audience":    formatOptInt64(s.Audience),
+	}
+	record := make([]string, len(csvColumns))
+	for i, column := range csvColumns {
+		record[i] = values[column]
+	}
+	return record
+}
+
+func formatOptInt64(v *int64) string {
+	if v == nil {
+		return ""
+	}
+	return strconv.FormatInt(*v, 10)
+}
+
+func boolTo01(v bool) string {
+	if v {
+		return "1"
+	}
+	return "0"
 }
 
 func (m *Manager) setError(err error) {

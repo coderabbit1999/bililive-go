@@ -43,7 +43,7 @@ const MonitorPage: React.FC = () => {
         try {
             const res = await fetch('/api/monitor/samples?limit=1000');
             if (!res.ok) {
-                throw new Error(`HTTP ${res.status}`);
+                throw new Error(`请求 /api/monitor/samples 失败：HTTP ${res.status} ${res.statusText}`.trim());
             }
             const data = await res.json();
             setSamples(data.samples || []);
@@ -162,7 +162,11 @@ const MonitorPage: React.FC = () => {
                         type="error"
                         showIcon
                         message={`数据刷新失败：${loadError}`}
-                        description="页面显示的是上一次成功获取的数据。"
+                        description={
+                            samples.length > 0
+                                ? '页面显示的是上一次成功获取的数据。'
+                                : '还没有成功获取过数据，请确认后端服务是否已启动。'
+                        }
                         style={{ marginBottom: 16 }}
                     />
                 )}
@@ -202,8 +206,9 @@ const MonitorPage: React.FC = () => {
                         options={rooms.map(([id, name]) => ({ value: id, label: `${name} (${id})` }))}
                     />
                     <Typography.Text type="secondary">
-                        数据文件：{status?.output || 'data/viewer_log.csv'}（人气每 {status?.interval_sec || 10} 秒、房间观众约每{' '}
-                        {status?.audience_interval_sec || 20} 秒更新）
+                        数据文件：{status?.output || 'data/viewer_log.csv'}
+                        {status &&
+                            `（人气每 ${status.interval_sec || 10} 秒、房间观众约每 ${status.audience_interval_sec || 20} 秒更新）`}
                     </Typography.Text>
                 </Space>
 
