@@ -13,7 +13,8 @@ import {
     LineChartOutlined,
     CloudUploadOutlined,
     CalendarOutlined,
-    CommentOutlined
+    CommentOutlined,
+    RiseOutlined
 } from '@ant-design/icons';
 import './layout.css';
 
@@ -123,6 +124,11 @@ class RootLayout extends React.Component<Props, State> {
                                         key: 'danmaku',
                                         icon: <CommentOutlined />,
                                         label: <Link to="/danmaku">弹幕</Link>,
+                                    },
+                                    {
+                                        key: 'monitor',
+                                        icon: <RiseOutlined />,
+                                        label: <Link to="/monitor">人气监控</Link>,
                                     },
                                     {
                                         key: '4',
