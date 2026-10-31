@@ -23,6 +23,7 @@ import (
 	"github.com/bililive-go/bililive-go/src/livestate"
 	"github.com/bililive-go/bililive-go/src/log"
 	"github.com/bililive-go/bililive-go/src/metrics"
+	"github.com/bililive-go/bililive-go/src/monitor"
 	"github.com/bililive-go/bililive-go/src/pipeline"
 	"github.com/bililive-go/bililive-go/src/pipeline/stages"
 	"github.com/bililive-go/bililive-go/src/pkg/events"
@@ -267,6 +268,9 @@ func main() {
 
 	// 发送启动统计（异步）
 	telemetry.GetInstance().SendStartup(ctx)
+
+	// 启动人气监控：采样 B 站公开数据并写入录制目录同级的 data/viewer_log.csv
+	monitor.Start(ctx, inst, config.OutPutPath)
 
 	if config.File != "" {
 		logger.Debugf("config path: %s.", config.File)
