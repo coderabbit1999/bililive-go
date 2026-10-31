@@ -68,13 +68,23 @@ func TestSampleRecordOrder(t *testing.T) {
 		"audience":    "7",
 	}
 
-	record := sampleRecord(s)
+	record, err := sampleRecord(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(want) != len(csvColumns) {
+		t.Fatalf("测试期望表有 %d 列，csvColumns 有 %d 列，测试未覆盖新增列", len(want), len(csvColumns))
+	}
 	if len(record) != len(csvColumns) {
 		t.Fatalf("列数 %d，期望 %d", len(record), len(csvColumns))
 	}
 	for i, column := range csvColumns {
-		if record[i] != want[column] {
-			t.Errorf("第 %d 列 %s = %q，期望 %q", i, column, record[i], want[column])
+		expected, ok := want[column]
+		if !ok {
+			t.Fatalf("测试期望表缺少列 %q", column)
+		}
+		if record[i] != expected {
+			t.Errorf("第 %d 列 %s = %q，期望 %q", i, column, record[i], expected)
 		}
 	}
 }

@@ -189,9 +189,18 @@ func (m *Manager) openOutput() error {
 	m.writer = csv.NewWriter(f)
 	if fresh {
 		if _, err := f.WriteString("\xEF\xBB\xBF" + csvHead); err != nil {
+			_ = f.Close()
+			m.file = nil
+			m.writer = nil
 			return err
 		}
 		m.writer.Flush()
+		if err := m.writer.Error(); err != nil {
+			_ = f.Close()
+			m.file = nil
+			m.writer = nil
+			return err
+		}
 	}
 	return nil
 }
@@ -370,9 +379,9 @@ func (m *Manager) writeRow(s Sample) error {
 		}
 		return fmt.Errorf("输出文件不可用: %s", m.output)
 	}
-	record := sampleRecord(s)
-	if len(record) != len(csvColumns) {
-		return fmt.Errorf("CSV 列数不一致: %d != %d", len(record), len(csvColumns))
+	record, err := sampleRecord(s)
+	if err != nil {
+		return err
 	}
 	if err := m.writer.Write(record); err != nil {
 		return err
@@ -382,8 +391,8 @@ func (m *Manager) writeRow(s Sample) error {
 }
 
 // sampleRecord 按 csvColumns 的顺序生成一行数据，列序只在 csvColumns 中维护。
-// 新增或删除列时，必须同时更新 csvColumns 和这里的取值映射。
-func sampleRecord(s Sample) []string {
+// 新增或删除列时，必须同时更新 csvColumns 和这里的取值映射；缺列会返回错误而不是写空串。
+func sampleRecord(s Sample) ([]string, error) {
 	values := map[string]string{
 		"ts":          s.TS,
 		"ts_unix":     strconv.FormatInt(s.TSUnix, 10),
@@ -400,9 +409,13 @@ func sampleRecord(s Sample) []string {
 	}
 	record := make([]string, len(csvColumns))
 	for i, column := range csvColumns {
-		record[i] = values[column]
+		value, ok := values[column]
+		if !ok {
+			return nil, fmt.Errorf("CSV 列 %q 没有对应的取值映射", column)
+		}
+		record[i] = value
 	}
-	return record
+	return record, nil
 }
 
 func formatOptInt64(v *int64) string {
